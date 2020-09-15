@@ -29,16 +29,15 @@ func Crawl(url string, depth int, fetcher Fetcher) {
 		mutex.Unlock()
 		return
 	}
+	visited[url] = true
+	mutex.Unlock()
 
 	body, urls, err := fetcher.Fetch(url)
 	if err != nil {
 		fmt.Println(err)
-		mutex.Unlock()
 		return
 	}
 	fmt.Printf("found: %s %q\n", url, body)
-	visited[url] = true
-	mutex.Unlock()
 	for _, u := range urls {
 		waitfor.Add(1)
 		if true {

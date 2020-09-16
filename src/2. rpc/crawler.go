@@ -24,7 +24,7 @@ func Crawl(url string, depth int, fetcher Fetcher) {
 	if depth <= 0 {
 		return
 	}
-	mutex.Loc()
+	mutex.Lock()
 	if v, ok := visited[url]; ok && v {
 		mutex.Unlock()
 		return

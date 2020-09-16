@@ -28,3 +28,9 @@ As far as I know there's not a great debugger for Go, though gdb can be
 made to work:
 
 https://golang.org/doc/gdb
+
+-----
+
+我™直接迷惑。
+
+这也太离谱了，lecture 2讲的啥呀，RPC呢？

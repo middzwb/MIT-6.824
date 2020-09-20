@@ -2,15 +2,11 @@
 
 -----
 
-为什么分布式这么“难”？
-
 可扩展性；性能；容错；一致性；负载均衡
 
 GFS2 Colossus
 
 -----
-
-### 使用场景
 
 倒排索引，
 
@@ -20,6 +16,6 @@ GFS2 Colossus
 
 -----
 
-1. 阅读mr应用代码
-2. 阅读顺序mr实现
-3. 根据论文整理mr工程实现要点
+map阶段：读取输入，map -> k,v
+shuffle阶段：将map的输出根据partition将kv写入到相应的intermediate，reduce读取所有的intermediate并sort
+reduce阶段，读取intermediate中的kv并写入到tempfile，全部生成后rename到output。（避免中间状态）

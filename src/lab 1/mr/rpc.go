@@ -27,7 +27,7 @@ type MapInputArgs struct {
 
 }
 type MapInputReply struct {
-    NReduce int
+    NReduced int
     Filename string
     Id int
     RealId int

@@ -16,6 +16,6 @@ GFS2 Colossus
 
 -----
 
-map阶段：读取输入，map -> k,v
-shuffle阶段：将map的输出根据partition将kv写入到相应的intermediate，reduce读取所有的intermediate并sort
-reduce阶段，读取intermediate中的kv并写入到tempfile，全部生成后rename到output。（避免中间状态）
+* map阶段：读取输入，map -> k,v
+* shuffle阶段：将map的输出根据partition将kv写入到相应的intermediate，reduce读取所有的intermediate并sort
+* reduce阶段，读取intermediate中的kv并写入到tempfile，全部生成后rename到output。（避免中间状态）

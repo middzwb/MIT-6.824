@@ -1,4 +1,4 @@
-# MapReduce Test
+## MapReduce Test
 
 第一次跑test时*Starting map parallelism test*和*Starting crash test*失败了。
 
@@ -32,6 +32,12 @@ rm: cannot remove '/var/tmp/824-mr-0': No such file or directory
 
 改完之后又跑了几次，`map parallelism`也都过了。
 
-## 总结
+### 总结
 
 总的来说，写一个玩具版的mr还是比较简单的，稍微注意下每个阶段结束的处理。
+
+## Raft Test
+
+### 2A
+
+实现选举，比较简单，在家里用手机写，然后跑过了

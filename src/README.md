@@ -41,3 +41,7 @@ rm: cannot remove '/var/tmp/824-mr-0': No such file or directory
 ### 2A
 
 实现选举，比较简单，在家里用手机写，然后跑过了
+
+### 2B
+
+apply to client的时候测试一直失败，最后打印输出后发现要求是**每个节点**都需要把commit的日志回复给client，所以commitIndex是有用的呀.

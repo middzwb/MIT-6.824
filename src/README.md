@@ -45,3 +45,27 @@ rm: cannot remove '/var/tmp/824-mr-0': No such file or directory
 ### 2B
 
 apply to client的时候测试一直失败，最后打印输出后发现要求是**每个节点**都需要把commit的日志回复给client，所以commitIndex是有用的呀.
+
+### 2C
+
+改的头皮发麻。
+
+-----
+
+首先是2B的遗漏。
+
+* 使用matchIndex更新commitIndex
+* 优化entry不一致时的reject回复，发送当前term的日志来代替单条发送
+* heartbeat消息不附带日志
+* 发送entry时，如果已经有更大的日志，则丢弃当前消息，因为更大的日志会附带当前日志
+
+TODO: 心跳消息只在业务负载低的时候发送，负载高的时候，AppendEntries本身已起到心跳作用(看zookeeper论文有感)
+
+#### 2C
+
+2C改的头皮发麻,改了两天，还是不清楚原因。从日志上看，本应该100ms发送的的心跳隔了500ms甚至更大才发送；还有AppendEntries的发送时间也很奇怪，不连续,发送给两个不同sever的entry中间相差很大，能有几百ms，明明是在一个循环里的。
+
+-----
+
+感觉可能是资源占用过多，用`top`看了一下，cpu和内存都没异常。突然灵机一动，在send AppendEntries和RequestVote的地方加了当前raft是否kill的判断，如果不判断的话，可能出现当前raft实例退出，但是发rpc的协程还没完成，结果无限重试。改完后，终于跑过了，看了一下日志，跑一个2c的日志，退出了2000+的协程，怪不得。
+

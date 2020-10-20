@@ -23,9 +23,10 @@ import "../labrpc"
 import "time"
 import "math/rand"
 import "fmt"
+import "sort"
 
-// import "bytes"
-// import "../labgob"
+import "bytes"
+import "../labgob"
 
 
 
@@ -82,25 +83,23 @@ type Raft struct {
 
     curr_term int
     voted_for int
-    log []*LogEntry
+    log []LogEntry
 
     commit_index int // 
     last_applied int
 
     next_index []int // AppendEntries
-    match_index []int
+    match_index []int // used for update commitIndex
 
     timeout time.Time // heartbeat timeout and election timeout
     delta time.Duration // sleep for timeout check
     received_vote int // received vote to candidate int current term
-    received_reply map[int]int // corresponding to logEntry
     state RaftState //
     cond *sync.Cond // notify heartbeat send thread
     majority int
     timeout_cond *sync.Cond // notify timeout check thread
 
     applyCh chan ApplyMsg
-    curr_command_index int // used for Start()
 }
 
 // return currentTerm and whether this server
@@ -131,6 +130,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+    w := new(bytes.Buffer)
+    e := labgob.NewEncoder(w)
+    e.Encode(rf.curr_term)
+    e.Encode(rf.voted_for)
+    e.Encode(rf.log)
+    rf.persister.SaveRaftState(w.Bytes())
 }
 
 
@@ -154,6 +160,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+    term := 0
+    voted_for := 0
+    log := make([]LogEntry, 0)
+	if d.Decode(&term) != nil ||
+	   d.Decode(&voted_for) != nil ||
+       d.Decode(&log) != nil {
+        rf.dout("readPersist error")
+	} else {
+        rf.curr_term = term
+        rf.voted_for = voted_for
+        rf.log = log
+        rf.dout("read persist t=%v v=%v log_len=%v", term, voted_for, len(log))
+	}
 }
 
 
@@ -193,6 +215,9 @@ type AppendEntriesReply struct {
     Term int
     Success bool
 
+    RStartIndex int // if rejected, first index in reject term
+    RTerm int
+    RLen int
 }
 
 //
@@ -208,11 +233,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     if rf.curr_term > args.Term {
         reply.VoteGranted = false
         reply.Term = rf.curr_term
+        rf.dout("reject Vote from [%v:%v]", args.CandidateId, args.Term)
         return
     }
 
     if rf.curr_term < args.Term {
-        rf.to_follower(args.Term)
+        rf.to_follower(args.Term, args.CandidateId)
     }
 
     reply.Term = args.Term
@@ -223,16 +249,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         last_index = len(rf.log) - 1
         last_term = rf.log[last_index].Term
     }
-    // curr term is more up-to-date than sender
-    if last_term > args.LastLogTerm {
+    // curr term is more up-to-date than sender or
+    // curr log index is more up-to-date than sender
+    if (last_term > args.LastLogTerm) ||
+        (last_term == args.LastLogTerm && last_index > args.LastLogIndex) {
         reply.VoteGranted = false
-    } else if last_term == args.LastLogTerm && last_index > args.LastLogIndex {
-        // curr log index is more up-to-date than sender
-        reply.VoteGranted = false
+        rf.dout("election restriction from [%v] [%v:%v] < [%v:%v]", args.CandidateId, args.LastLogIndex, args.LastLogTerm,
+            last_index, last_term)
     } else {
         if rf.voted_for == -1 || rf.voted_for == args.CandidateId { // reply maybe lost
             rf.voted_for = args.CandidateId
             reply.VoteGranted = true
+            rf.persist()
+            rf.dout("vote to [%v]", args.CandidateId)
+            //rf.update_timeout()
         }
     }
 
@@ -308,9 +338,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
             Term: term,
             Index: index,
         }
-        rf.log = append(rf.log, entry)
-        rf.received_reply[index] = 1
+        rf.log = append(rf.log, *entry)
+        rf.match_index[rf.me] = index
         // persist to local
+        rf.persist()
         // 2. concurrent append
         for i, _ := range rf.peers {
             if i != rf.me {
@@ -373,19 +404,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.applyCh = applyCh
     rf.commit_index = -1
     rf.next_index = make([]int, len(peers))
-    for i := 0; i < len(rf.peers); i++ {
-        rf.next_index[i] = len(rf.log)
-    }
-    rf.received_reply = make(map[int]int)
-    go rf.timeout_check()
-
-    go rf.heartbeat_entry()
+    rf.match_index = make([]int, len(peers))
 
     // receive msg from leader or candidate
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+    for i := 0; i < len(rf.peers); i++ {
+        rf.next_index[i] = len(rf.log)
+        rf.match_index[i] = -1 // our first index is 0
+    }
+    go rf.timeout_check()
+
+    go rf.heartbeat_entry()
 
 	return rf
 }
@@ -400,8 +432,9 @@ func (rf *Raft) timeout_check() {
                 // timeout, convert to candidate
                 rf.to_candidate()
             }
+            tmp := rf.delta
             rf.mu.Unlock()
-            time.Sleep(rf.delta)
+            time.Sleep(tmp)
             if rf.killed() {
                 return
             }
@@ -423,6 +456,10 @@ func (rf *Raft) handle_send_request_vote(term int, last_index int, last_term int
     var reply *RequestVoteReply
 
     for {
+        if rf.killed() {
+            rf.dout("quit killed rpc RequestVote")
+            return
+        }
         reply = &RequestVoteReply{}
         if ok := rf.sendRequestVote(s, args, reply); ok {
             break
@@ -448,19 +485,20 @@ func (rf *Raft) handle_send_request_vote(term int, last_index int, last_term int
         rf.dout("received vote from [%v]", s)
         rf.received_vote++
         if rf.received_vote == rf.majority {
-            // convert to leader
+            // convert to leader, no need to persist
             rf.state = STATE_LEADER
             rf.cond.Broadcast()
-            rf.dout("to leader term[%v]", rf.curr_term)
-            // initialize nextIndex
+            rf.dout("to leader term[%v] %v", rf.curr_term, rf.log)
+            // initialize nextIndex and matchIndex
             for i := 0; i < len(rf.next_index); i++ {
                 rf.next_index[i] = len(rf.log)
+                rf.match_index[i] = -1
             }
         }
     } else if reply.Term > rf.curr_term {
         // update higher term from reply
         // convert to follower
-        rf.to_follower(reply.Term)
+        rf.to_follower(reply.Term, s)
     }
 }
 
@@ -469,6 +507,7 @@ func (rf *Raft) to_candidate() {
     rf.voted_for = rf.me
     rf.received_vote = 1
     rf.state = STATE_CANDIDATE
+    rf.update_timeout()
     rf.dout("to candidate term[%v]", rf.curr_term)
 
     last_index := -1
@@ -477,6 +516,8 @@ func (rf *Raft) to_candidate() {
         last_index = len(rf.log) - 1
         last_term = rf.log[last_index].Term
     }
+
+    rf.persist()
 
     for i, _ := range rf.peers {
         if i != rf.me {
@@ -511,7 +552,12 @@ func (rf *Raft) heartbeat_entry() {
 func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
     rf.mu.Lock()
     if term != rf.curr_term {
-        rf.dout(" %v -> %v discard AppendEntries", term, rf.curr_term)
+        rf.dout("%v -> %v discard AppendEntries", term, rf.curr_term)
+        rf.mu.Unlock()
+        return
+    }
+    if entry != nil && entry.Index != len(rf.log) - 1 {
+        rf.dout("has greater entry, discard current")
         rf.mu.Unlock()
         return
     }
@@ -520,11 +566,10 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
         LeaderId: rf.me,
         LeaderCommit: rf.commit_index,
     }
-    last_next_index := -1
     if entry != nil {
         if rf.next_index[s] > entry.Index {
             // discard log that has been replicated
-            rf.dout("Error AppendEntries curr index=%v, next index=%v peer=%v", entry.Index, rf.next_index[s], s)
+            rf.dout("discard AppendEntries to [%v] nextIndex:%v > entry.Index:%v", s, rf.next_index[s], entry.Index)
             rf.mu.Unlock()
             return
         }
@@ -534,19 +579,22 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
         }
         args.Entries = make([]LogEntry, 0, entry.Index - rf.next_index[s] + 1)
         for i := entry.Index; i > args.PrevLogIndex; i-- {
-            args.Entries = append(args.Entries, *rf.log[i])
+            args.Entries = append(args.Entries, rf.log[i])
         }
-        rf.dout("send AppendEntries %v to [%v]", args.Entries, s)
+        rf.dout("send AppendEntries [%v->%v] to [%v]", args.Entries[len(args.Entries)-1], args.Entries[0], s)
     } else {
         args.PrevLogIndex = rf.next_index[s] - 1
         if args.PrevLogIndex >= 0 {
             args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
         }
-        last_next_index = rf.next_index[s]
     }
     rf.mu.Unlock()
     var reply *AppendEntriesReply
     for {
+        if rf.killed() {
+            rf.dout("quit killed rpc AppendEntries")
+            return
+        }
         // msg will retry, so reply need update, otherwile will get WARN:
         // "labgob warning: Decoding into a non-default variable/field Term may not work"
         reply = &AppendEntriesReply{}
@@ -556,6 +604,9 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
         if rf.curr_term > args.Term {
             rf.mu.Unlock()
             return
+        }
+        if !ok {
+            //rf.dout("msg lost, retry AppendEntries to [%v]", s)
         }
         rf.mu.Unlock()
 
@@ -567,32 +618,58 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
         // consistency check failed
         if reply.Term == args.Term && !reply.Success {
             rf.mu.Lock()
-            // next_index maybe changed by other rpc, so we fill entry again rather than append previous log entry
+            // next_index maybe changed by other rpc, so we fill entries again rather than append previous log entry
             //args.Entries = append(args.Entries, *rf.log[args.PrevLogIndex])
-            rf.next_index[s] -= 1
+
+            if entry != nil && rf.next_index[s] > entry.Index {
+                // other thread has update nextIndex by append log entry
+                rf.dout("handle_append_entries nextIndex greater than entryIndex %v->%v", rf.next_index[s], entry.Index)
+                rf.mu.Unlock()
+                return
+            }
+            if reply.RTerm == -1 {
+                // peer s log is empty
+                rf.next_index[s] = 0
+            } else {
+                // find last consistent log entry
+
+                if rf.next_index[s] <= reply.RStartIndex {
+                    // other thread has decrease nextIndex
+                } else {
+                    find := false
+                    for i := reply.RStartIndex + reply.RLen - 1; i >= reply.RStartIndex; i-- {
+                        if rf.log[i].Term == reply.RTerm {
+                            // last consistent entry 
+                            rf.dout("find consistent entry %v", rf.log[i].str())
+                            rf.next_index[s] = i + 1
+                            find = true
+                            break
+                        }
+                    }
+                    if !find {
+                        rf.next_index[s] = reply.RStartIndex
+                    }
+                }
+            }
             args.PrevLogIndex = rf.next_index[s] - 1
             if entry != nil {
                 args.Entries = args.Entries[:0]
                 for i := entry.Index; i > args.PrevLogIndex; i-- {
-                    args.Entries = append(args.Entries, *rf.log[i])
+                    args.Entries = append(args.Entries, rf.log[i])
                 }
             } else {
-                // heartbeat check failed, we append log entry
-                if args.Entries == nil {
-                    args.Entries = make([]LogEntry, 0, 1)
-                } else {
-                    args.Entries = args.Entries[:0]
-                }
-                // next_index will be changed by other thread
-                for i := last_next_index - 1; i > args.PrevLogIndex; i-- {
-                    args.Entries = append(args.Entries, *rf.log[i])
-                }
+                // heartbeat check failed, should not send log entry,just update nextIndex
             }
             if args.PrevLogIndex >= 0 {
                 args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
             }
+            if args.Entries != nil {
+                rf.dout("got reject from %v retry [%v->%v], [%v:%v]", s, args.Entries[len(args.Entries)-1], args.Entries[0],
+                args.PrevLogIndex, args.PrevLogTerm)
+            } else {
+                rf.dout("got reject heartbeat from %v retry, [%v:%v]", s, args.PrevLogIndex, args.PrevLogTerm)
+            }
             rf.mu.Unlock()
-            rf.dout("got reject from %v retry %v", s, args.Entries)
             continue
         }
         break
@@ -606,14 +683,9 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
 
     if reply.Term == args.Term {
         if entry != nil {
-            // log entry has replicated successfully
-            // [next_index, en.Index]
-            commit := -1
-            for i := rf.next_index[s]; i <= entry.Index; i++ {
-                rf.received_reply[i] += 1
-                if rf.received_reply[i] >= rf.majority {
-                    commit = i
-                }
+            // log entry has replicated successfully, update matchIndex
+            if rf.match_index[s] < entry.Index {
+                rf.match_index[s] = entry.Index
             }
             // update nextIndex
             if rf.next_index[s] < entry.Index + 1{
@@ -621,6 +693,7 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
                 rf.next_index[s] = entry.Index + 1
             }
             // commit
+            commit := rf.get_match()
             for i := rf.commit_index + 1; i <= commit; i++ {
                 // reply to client and apply to state machine
                 apply := ApplyMsg{
@@ -628,16 +701,15 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
                     Command: rf.log[i].Command,
                     CommandIndex: i + 1, // first is 1
                 }
-                rf.dout("handle_append_entries send %v reply to client", rf.log[i].str())
                 rf.applyCh <- apply
             }
             if rf.commit_index < commit {
-                rf.dout("commitIndex %v -> %v", rf.commit_index, commit)
+                rf.dout("commitIndex[%v] %v -> %v", s, rf.commit_index, commit)
                 rf.commit_index = commit
             }
         }
     } else if reply.Term > rf.curr_term {
-        rf.to_follower(reply.Term)
+        rf.to_follower(reply.Term, s)
     }
 }
 
@@ -650,49 +722,75 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         return
     } else {
         // update heartbeat timeout
-        rf.update_timeout()
+        defer rf.update_timeout()
 
         reply.Term = args.Term
-        rf.to_follower(args.Term)
+        rf.to_follower(args.Term, args.LeaderId)
         // consistency check
         if args.PrevLogIndex >= len(rf.log) {
+            // PrevIndex not in my log
+            log_len := len(rf.log)
+            if log_len == 0 {
+                reply.RStartIndex = -1
+                reply.RTerm = -1
+                reply.RLen = 0
+            } else {
+                reply.RTerm = rf.log[log_len-1].Term
+                reply.RStartIndex = rf.find_first_index(reply.RTerm)
+                reply.RLen = log_len - reply.RStartIndex
+            }
+            rf.dout("AppendEntries reject from [%v] (%v > %v) [%v:%v]", args.LeaderId, args.PrevLogIndex, log_len,
+                reply.RStartIndex, reply.RTerm)
             reply.Success = false
         } else if args.PrevLogIndex != -1 &&
-        rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+            rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+            // PrevIndex in my log
+            reply.RTerm = rf.log[args.PrevLogIndex].Term
+            reply.RStartIndex = rf.find_first_index(reply.RTerm)
+            reply.RLen = args.PrevLogIndex - reply.RStartIndex + 1
+            rf.dout("AppendEntries reject %v != [%v:%v] [%v:%v]", rf.log[args.PrevLogIndex], args.PrevLogIndex, args.PrevLogTerm,
+                reply.RStartIndex, reply.RTerm)
             reply.Success = false
         } else {
             reply.Success = true
         }
-        if len(args.Entries) != 0 {
-            if reply.Success {
-                // append entries
-                log_size := len(rf.log)
-                en_size := len(args.Entries)
-                start := -1
-                for i := en_size - 1; i >= 0; i-- {
-                    en := &args.Entries[i]
-                    if en.Index < log_size && en.Term != rf.log[en.Index].Term {
-                        // erase inconsistent log
-                        rf.dout("AppendEntries inconsistent log %v != %v",
-                            en.str(), rf.log[en.Index].str())
-                        start = i
-                        rf.log = rf.log[:en.Index]
-                        break
-                    } else if en.Index >= log_size {
-                        // append all entries
-                        start = i
-                        break
-                    }
-                }
-                for ; start >= 0; start-- {
-                    en := &args.Entries[start]
-                    rf.log = append(rf.log, en)
-                    rf.dout("AppendEntries %v from [%v]", en.str(), args.LeaderId)
-                }
-            }
-        }
+
         if !reply.Success {
             return
+        }
+        if len(args.Entries) != 0 {
+            // append entries
+            log_size := len(rf.log)
+            en_size := len(args.Entries)
+            start := -1
+            for i := en_size - 1; i >= 0; i-- {
+                en := &args.Entries[i]
+                if en.Index < log_size && en.Term != rf.log[en.Index].Term {
+                    // erase inconsistent log
+                    rf.dout("AppendEntries inconsistent log %v != %v",
+                    en.str(), rf.log[en.Index].str())
+                    start = i
+                    rf.log = rf.log[:en.Index]
+                    break
+                } else if en.Index >= log_size {
+                    // append all entries
+                    start = i
+                    break
+                }
+            }
+            if start >= 0 {
+                tmp := "empty"
+                if l := len(rf.log); l > 0 {
+                    tmp = (&rf.log[l-1]).str()
+                }
+                rf.dout("AppendEntries %v -> [%v->%v]", tmp, args.Entries[start], args.Entries[0])
+            }
+            for ; start >= 0; start-- {
+                en := &args.Entries[start]
+                rf.log = append(rf.log, *en)
+            }
+            // persist log entry
+            rf.persist()
         }
         // commit log
         if len(rf.log) == 0 || rf.log[len(rf.log)-1].Term != args.Term {
@@ -709,25 +807,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
             } else if len(rf.log) == 0 {
                 rf.commit_index = -1
             }
-            tmp := make([]*LogEntry, 0)
             for i := last_commit + 1; i <= rf.commit_index; i++ {
                 apply := ApplyMsg{
                     CommandValid: true,
                     Command: rf.log[i].Command,
                     CommandIndex: rf.log[i].Index + 1, // first is 1
                 }
-                rf.dout("follower apply %v from [%v]", rf.log[i].str(), args.LeaderId)
                 rf.applyCh <- apply
-                tmp = append(tmp, rf.log[i])
             }
-            //rf.dout("follower apply %v", tmp)
+            if last_commit < rf.commit_index {
+                rf.dout("follower commit %v -> %v", last_commit, rf.commit_index)
+            }
         }
     }
 }
 
 func (rf *Raft) update_timeout() {
     r := rand.New(rand.NewSource(time.Now().UnixNano()))
-    rf.delta = time.Duration(300 + r.Intn(400)) * time.Millisecond
+    rf.delta = time.Duration(200 + r.Intn(300)) * time.Millisecond
     rf.timeout = time.Now().Add(rf.delta)
 }
 
@@ -735,19 +832,56 @@ func (rf *Raft) is_leader() bool {
     return rf.state == STATE_LEADER
 }
 
-func (rf *Raft) to_follower(t int) {
+func (rf *Raft) to_follower(t int, s int) {
     if rf.state == STATE_FOLLOWER && rf.curr_term == t {
         return
+    }
+    if rf.is_leader() {
+        rf.update_timeout()
     }
     rf.state = STATE_FOLLOWER
     rf.curr_term = t
     rf.voted_for = -1
     rf.received_vote = 0
     rf.timeout_cond.Broadcast()
-    rf.dout("to follower term[%v]", t)
+    rf.dout("to follower term[%v] from [%v]", t, s)
+    rf.persist()
 }
 
+func (rf *Raft) stateString() string {
+    switch rf.state {
+    case STATE_FOLLOWER:
+        return "F"
+    case STATE_LEADER:
+        return "L"
+    case STATE_CANDIDATE:
+        return "C"
+    default:
+        return "unknown"
+    }
+}
 func (rf *Raft) dout(format string, a ...interface{}) {
-    tmp := fmt.Sprintf("[%v]", rf.me)
+    tmp := fmt.Sprintf("[%v:%v:%v]", rf.me, rf.curr_term, rf.stateString())
     dprintf(tmp + format, a...)
+}
+
+type sortMatch []int
+func (s sortMatch) Len() int { return len(s) }
+func (s sortMatch) Less(i, j int) bool { return s[i] < s[j] }
+func (s sortMatch) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+func (rf *Raft) get_match() int {
+    tmp := make([]int, len(rf.match_index))
+    for i, m := range rf.match_index {
+        tmp[i] = m
+    }
+    // Top-K, we can use quick select algorithm that time complexity is O(n)
+    sort.Sort(sortMatch(tmp))
+    return tmp[rf.majority-1]
+}
+
+func (rf *Raft) find_first_index(term int) int {
+    // log is sequential, use binary search
+    ret := sort.Search(len(rf.log), func(i int) bool {return rf.log[i].Term >= term })
+    return ret
 }

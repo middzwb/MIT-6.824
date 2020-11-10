@@ -45,6 +45,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+    CommandTerm  int
 }
 
 type LogEntry struct {
@@ -100,6 +101,7 @@ type Raft struct {
     timeout_cond *sync.Cond // notify timeout check thread
 
     applyCh chan ApplyMsg
+    leader int32
 }
 
 // return currentTerm and whether this server
@@ -488,11 +490,23 @@ func (rf *Raft) handle_send_request_vote(term int, last_index int, last_term int
             // convert to leader, no need to persist
             rf.state = STATE_LEADER
             rf.cond.Broadcast()
-            rf.dout("to leader term[%v] %v", rf.curr_term, rf.log)
+            rf.dout("to leader term[%v] log size=%v", rf.curr_term, len(rf.log))
             // initialize nextIndex and matchIndex
             for i := 0; i < len(rf.next_index); i++ {
                 rf.next_index[i] = len(rf.log)
                 rf.match_index[i] = -1
+            }
+            // invalidate commitIndex+1 ~ last log
+            // case: after partition heal; client will still wait for reply, but server won't reply if there is no
+            // new request, so we enforce reply with false, indicate the request is not commited
+            for i := rf.commit_index + 1; i < len(rf.log); i++ {
+                apply := ApplyMsg{
+                    CommandValid: false,
+                    Command: rf.log[i].Command,
+                    CommandIndex: i + 1, // first is 1
+                    CommandTerm: rf.curr_term,
+                }
+                rf.applyCh <- apply
             }
         }
     } else if reply.Term > rf.curr_term {
@@ -542,7 +556,9 @@ func (rf *Raft) heartbeat_entry() {
             if rf.killed() {
                 return
             }
+            //rf.dout("prepare to send heartbeat before acquire lock")
             rf.mu.Lock()
+            //rf.dout("prepare to send heartbeat")
         }
         rf.cond.Wait()
     }
@@ -560,6 +576,9 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
         rf.dout("has greater entry, discard current")
         rf.mu.Unlock()
         return
+    }
+    if entry == nil {
+        //rf.dout("send heartbeat to [%v]", s)
     }
     args := &AppendEntriesArgs{
         Term: term,
@@ -700,6 +719,7 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
                     CommandValid: true,
                     Command: rf.log[i].Command,
                     CommandIndex: i + 1, // first is 1
+                    CommandTerm: rf.curr_term,
                 }
                 rf.applyCh <- apply
             }
@@ -716,6 +736,9 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     rf.mu.Lock()
     defer rf.mu.Unlock()
+    if len(args.Entries) == 0 {
+        //rf.dout("receive heartbeat from [%v:%v]", args.LeaderId, args.Term)
+    }
     if rf.curr_term > args.Term {
         reply.Success = false
         reply.Term = rf.curr_term
@@ -726,6 +749,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
         reply.Term = args.Term
         rf.to_follower(args.Term, args.LeaderId)
+        atomic.StoreInt32(&rf.leader, int32(args.LeaderId))
         // consistency check
         if args.PrevLogIndex >= len(rf.log) {
             // PrevIndex not in my log
@@ -794,7 +818,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         }
         // commit log
         if len(rf.log) == 0 || rf.log[len(rf.log)-1].Term != args.Term {
-            // don't commit log less than current term
+            // don't commit log entry that term less than current term
+
+            // invalidate client request
+            for i := rf.commit_index + 1; i < len(rf.log); i++ {
+                apply := ApplyMsg{
+                    CommandValid: false,
+                    Command: rf.log[i].Command,
+                    CommandIndex: i + 1, // first is 1
+                    CommandTerm: rf.curr_term,
+                }
+                rf.applyCh <- apply
+            }
             return
         }
         if rf.commit_index >= args.LeaderCommit {
@@ -812,6 +847,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                     CommandValid: true,
                     Command: rf.log[i].Command,
                     CommandIndex: rf.log[i].Index + 1, // first is 1
+                    CommandTerm: rf.curr_term,
                 }
                 rf.applyCh <- apply
             }
@@ -824,7 +860,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) update_timeout() {
     r := rand.New(rand.NewSource(time.Now().UnixNano()))
-    rf.delta = time.Duration(200 + r.Intn(300)) * time.Millisecond
+    rf.delta = time.Duration(300 + r.Intn(400)) * time.Millisecond
     rf.timeout = time.Now().Add(rf.delta)
 }
 
@@ -884,4 +920,9 @@ func (rf *Raft) find_first_index(term int) int {
     // log is sequential, use binary search
     ret := sort.Search(len(rf.log), func(i int) bool {return rf.log[i].Term >= term })
     return ret
+}
+
+func (rf *Raft) GetLeader() int {
+    l := atomic.LoadInt32(&rf.leader)
+    return int(l)
 }

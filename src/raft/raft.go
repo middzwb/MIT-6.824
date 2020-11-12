@@ -763,9 +763,9 @@ func (rf *Raft) handle_append_entries(term int, s int, entry *LogEntry) {
             }
             eval_prev()
             if entry != nil {
-                if entry.Index == args.PrevLogIndex {
+                if entry.Index <= args.PrevLogIndex {
                     // this entry has receive majority reply, so can be take snapshot,
-                    rf.dout("after consistency check, current entry is in snapshot %v=%v", entry.Index, args.PrevLogIndex)
+                    rf.dout("after consistency check, current entry is in snapshot %v<=%v", entry.Index, args.PrevLogIndex)
                     rf.mu.Unlock()
                     rf.handle_install_snapshot(args.Term, s)
                     return

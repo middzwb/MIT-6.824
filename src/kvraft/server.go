@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
     "fmt"
     "runtime"
+    "time"
+    "bytes"
 )
 
 const (
@@ -22,6 +24,8 @@ func dout(format string, a ...interface{}) (n int, err error) {
     log.Printf(format, a...)
 	return
 }
+
+const SnapCheckInterval = 100 * time.Millisecond
 
 type OpType int
 const (
@@ -61,8 +65,11 @@ type KVServer struct {
     apply_mu sync.Mutex
     apply_cond *sync.Cond
     apply []raft.ApplyMsg
-
     applied map[int64]int64 // key: client id; val: max applied request id
+
+    last_received_index int
+    last_received_term int
+    snapshot_cond *sync.Cond
 }
 
 
@@ -185,6 +192,7 @@ func (kv *KVServer) Kill() {
             cond.Broadcast()
         }
     }
+    kv.snapshot_cond.Broadcast()
     kv.mu.Unlock()
 
     // kill reply handle
@@ -234,9 +242,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
     kv.apply_cond = sync.NewCond(&kv.apply_mu)
     kv.apply = make([]raft.ApplyMsg, 0)
     kv.applied = make(map[int64]int64)
+    kv.last_received_index = -1
+    kv.last_received_term = -1
+    kv.snapshot_cond = sync.NewCond(&kv.mu)
+
+    kv.decode_snapshot(kv.rf.ReadSnapshot())
 
     go kv.apply_entry()
     go kv.handle_apply_entry()
+    if maxraftstate != -1 {
+        go kv.snapshot_entry()
+    }
 	return kv
 }
 
@@ -250,8 +266,13 @@ func (kv *KVServer) dout(format string, a ...interface{}) {
 }
 
 func (kv *KVServer) apply_entry() {
-    for !kv.killed() {
-        msg := <-kv.applyCh
+    for {
+        msg, ok := <-kv.applyCh
+
+        if !ok {
+            kv.dout("chan closed apply_entry exit")
+            return
+        }
 
         kv.apply_mu.Lock()
         kv.apply = append(kv.apply, msg)
@@ -305,10 +326,22 @@ func (kv *KVServer) handle_apply_entry() {
         for i, _ := range tmp {
             msg := &tmp[i]
             if msg.CommandValid {
-                op := tmp[i].Command.(Op)
+                // index is monotonic increase
+                kv.assert(msg.CommandIndex > kv.last_received_index, "Error index %v>%v", msg.CommandIndex, kv.last_received_index)
+                kv.last_received_term = msg.CommandTerm
+                kv.last_received_index = msg.CommandIndex
+                op := msg.Command.(Op)
                 kv.apply_to_table(&op)
+
+                if kv.maxraftstate <= kv.rf.RaftStateSize() {
+                    kv.snapshot_cond.Broadcast()
+                }
             } else {
                 // maybe need retry to commit log entry
+                if msg.Snapshot {
+                    data := msg.Command.([]byte)
+                    kv.decode_snapshot(data)
+                }
             }
             term := tmp[i].CommandTerm
             index := tmp[i].CommandIndex
@@ -321,10 +354,10 @@ func (kv *KVServer) handle_apply_entry() {
             for i, v := range kv.op_conds {
                 if i < term {
                     kv.dout("ex-term %v < %v", i, term)
-                    // unlike c++, delete in range-for is safe
                     for _, cond := range v {
                         cond.Broadcast()
                     }
+                    // unlike c++, delete in range-for is safe
                     delete(kv.op_conds, i)
                 }
             }
@@ -340,4 +373,66 @@ func (kv *KVServer) generate_cond(term int, index int) *sync.Cond {
     }
     kv.op_conds[term][index] = cond
     return cond
+}
+
+func (kv *KVServer) snapshot_entry() {
+    kv.mu.Lock()
+    for !kv.killed() {
+        kv.snapshot_cond.Wait()
+        if kv.maxraftstate <= kv.rf.RaftStateSize() {
+            kv.dout("start snapshot %v>%v", kv.rf.RaftStateSize(), kv.maxraftstate)
+            // perform snapshot
+            // block other operation
+            w := new(bytes.Buffer)
+            e := labgob.NewEncoder(w)
+            e.Encode(kv.kvtable)
+            e.Encode(kv.applied) // detect duplicate after restart
+            e.Encode(kv.last_received_index)
+            e.Encode(kv.last_received_term)
+            index := kv.last_received_index
+            term := kv.last_received_term
+            kv.mu.Unlock()
+            kv.rf.SaveStateAndSnapshot(w.Bytes(), index, term)
+            kv.mu.Lock()
+        }
+        //time.Sleep(SnapCheckInterval)
+    }
+    kv.mu.Unlock()
+}
+
+func (kv *KVServer) decode_snapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+    kvtable := make(map[string]string)
+    applied := make(map[int64]int64)
+    index := 0
+    term := 0
+	if d.Decode(&kvtable) != nil ||
+       d.Decode(&applied) != nil ||
+       d.Decode(&index) != nil ||
+       d.Decode(&term) != nil {
+        kv.dout("readPersist error")
+	} else {
+        //kv.assert(index > kv.last_received_index, "Error decode index %v>%v", index, kv.last_received_index)
+        if index <= kv.last_received_index {
+            kv.dout("WARNING: old snapshot %v<%v discard", index, kv.last_received_index)
+            return
+        }
+        kv.kvtable = kvtable
+        kv.applied = applied
+        kv.last_received_index = index
+        kv.last_received_term = term
+        kv.dout("read persist table size=%v, applied=%v, snapshot[%v:%v]", len(kvtable), len(applied), index, term)
+	}
+}
+
+func (kv *KVServer) assert(condition bool, msg string, args ...interface{}) {
+    if !condition {
+        tmp := fmt.Sprintf("[S_%v]", kv.me)
+        log.Fatalf(tmp + msg, args...)
+    }
 }

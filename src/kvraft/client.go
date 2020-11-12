@@ -11,7 +11,7 @@ import "fmt"
 ///*********************************
 
 const (
-    RetryCount = 10
+    RetryCount = 5
 )
 
 type Clerk struct {
@@ -76,7 +76,7 @@ func (ck *Clerk) Get(key string) string {
                 // change other server
                 ck.leader_id = (ck.leader_id + 1) % len(ck.servers)
                 retry = 0
-                ck.dout("retry is max ,change leader")
+                //ck.dout("retry is max ,change leader")
             }
             continue
         }
@@ -127,7 +127,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
                 // change other server
                 ck.leader_id = (ck.leader_id + 1) % len(ck.servers)
                 retry = 0
-                ck.dout("retry is max ,change leader")
+                //ck.dout("retry is max ,change leader")
             }
             continue
         }
@@ -162,7 +162,7 @@ func (ck *Clerk) dout(format string, a ...interface{}) {
 func (ck *Clerk) revise_leader(s int, new_leader int) {
     if  s != ck.leader_id {
         ck.servers[s], ck.servers[ck.leader_id] = ck.servers[ck.leader_id], ck.servers[s]
-        ck.dout("change order %v->%v", ck.leader_id, s)
+        //ck.dout("change order %v->%v", ck.leader_id, s)
         ck.correct_servers[s] = true
     }
     if !ck.correct_servers[new_leader] {

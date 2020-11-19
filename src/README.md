@@ -1,7 +1,5 @@
 ## MapReduce Test
 
-第一次跑test时*Starting map parallelism test*和*Starting crash test*失败了。
-
 * Starting map parallelism test输出`saw 0 workers rather than 2`
 
 后面又跑了两次，`map parallelism`成功了一次，另一次`saw 1 workers rather than 2`。而crash test一直失败。我的crash实现是master和worker之间保持心跳，超时后重新将task分配给其他的worker，没有重新拉起worker，看了脚本和代码后，确实是随机退出某个worker进程，实现没有问题。单独调试crash，发现master忘记开接收心跳的线程了!!!(ｷ｀ﾟДﾟ´)!!
@@ -29,10 +27,6 @@ rm: cannot remove '/var/tmp/824-mr-0': No such file or directory
 --- crash test: PASS
 *** PASSED ALL TESTS
 ```
-
-改完之后又跑了几次，`map parallelism`也都过了。
-
-### 总结
 
 总的来说，写一个玩具版的mr还是比较简单的，稍微注意下每个阶段结束的处理。
 
@@ -71,3 +65,6 @@ TODO: 心跳消息只在业务负载低的时候发送，负载高的时候，Ap
 
 感觉可能是资源占用过多，用`top`看了一下，cpu和内存都没异常。突然灵机一动，在send AppendEntries和RequestVote的地方加了当前raft是否kill的判断，如果不判断的话，可能出现当前raft实例退出，但是发rpc的协程还没完成，结果无限重试。改完后，终于跑过了，看了一下日志，跑一个2c的日志，退出了2000+的协程，怪不得。
 
+### 3B
+
+chan没做关闭的处理，导致死锁

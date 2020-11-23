@@ -7,4 +7,7 @@
 
 [//]: [英文字幕](https://www.yuque.com/guigumentor/babel)
 
-TODO: shardedkv
+* [x] mr
+* [x] raft
+* [x] kvraft
+* [ ] shardedkv
